@@ -46,6 +46,47 @@ from generative_recommenders.research.rails.similarities.module import Similarit
 
 TIMESTAMPS_KEY = "timestamps"
 
+# ================= [新增] RoPE 工具代码开始 =================
+class RotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self._set_cos_sin_cache(max_position_embeddings, device=device, dtype=torch.get_default_dtype())
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [batch, seq_len, n_heads, head_dim]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        return (
+            self.cos_cached[:seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:seq_len, ...].to(dtype=x.dtype),
+        )
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    # q, k: [batch, seq_len, n_heads, head_dim]
+    # cos, sin: [seq_len, head_dim] -> unsqueeze to [1, seq_len, 1, head_dim]
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+# ================= [新增] RoPE 工具代码结束 =================
 
 class RelativeAttentionBiasModule(torch.nn.Module):
     @abc.abstractmethod
@@ -159,7 +200,8 @@ def _hstu_attention_maybe_from_cache(
     x_offsets: torch.Tensor,
     all_timestamps: Optional[torch.Tensor],
     invalid_attn_mask: torch.Tensor,
-    rel_attn_bias: RelativeAttentionBiasModule,
+    rel_attn_bias: Optional[RelativeAttentionBiasModule], # 改为 Optional
+    rotary_emb: Optional[RotaryEmbedding] = None,         # [新增] 参数
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B: int = x_offsets.size(0) - 1
     n: int = invalid_attn_mask.size(-1)
@@ -199,7 +241,25 @@ def _hstu_attention_maybe_from_cache(
         padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
             values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
         )
-
+    # ================= [修改开始] 插入 RoPE 逻辑 =================
+    # 此时 padded_q 的形状是 [B, N, num_heads * attention_dim]
+    if rotary_emb is not None:
+        # 1. 重塑为 [B, N, Heads, Dim] 以适配 RoPE
+        q_rope = padded_q.view(B, n, num_heads, attention_dim)
+        k_rope = padded_k.view(B, n, num_heads, attention_dim)
+        
+        # 2. 获取 cos, sin
+        cos, sin = rotary_emb(q_rope, seq_len=n)
+        
+        # 3. 应用旋转
+        q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin)
+        
+        # 4. 这里的 q_rope 可以直接用于下面的计算，或者展平回去
+        # 为了最小化改动代码，我们展平回去赋值给 padded_q
+        padded_q = q_rope.reshape(B, n, -1)
+        padded_k = k_rope.reshape(B, n, -1)
+    # ================= [修改结束] =================
+    
     qk_attn = torch.einsum(
         "bnhd,bmhd->bhnm",
         padded_q.view(B, n, num_heads, attention_dim),
@@ -237,12 +297,24 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         linear_config: str = "uvqk",
         concat_ua: bool = False,
         epsilon: float = 1e-6,
-        max_length: Optional[int] = None,
+        use_rope: bool = False, # [新增] 开关参数，默认为 False 以防破坏原有逻辑
+        max_length: Optional[int] = 2048, # 确保 max_length 有默认值
     ) -> None:
         super().__init__()
         self._embedding_dim: int = embedding_dim
         self._linear_dim: int = linear_hidden_dim
         self._attention_dim: int = attention_dim
+        # ================= [新增] 初始化 RoPE =================
+        self.use_rope = use_rope
+        self.rope = None
+        if self.use_rope:
+            # 注意：RoPE 作用在 head_dim 上，即 attention_dim
+            # 这里的 attention_dim 实际上是论文里的 d_k (dimension per head)
+            self.rope = RotaryEmbedding(
+                dim=attention_dim, 
+                max_position_embeddings=max_length if max_length else 4096
+            )
+        # ====================================================
         self._dropout_ratio: float = dropout_ratio
         self._attn_dropout_ratio: float = attn_dropout_ratio
         self._num_heads: int = num_heads
@@ -340,7 +412,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
 
         B: int = x_offsets.size(0) - 1
         if self._normalization == "rel_bias" or self._normalization == "hstu_rel_bias":
-            assert self._rel_attn_bias is not None
+            #assert self._rel_attn_bias is not None
             attn_output, padded_q, padded_k = _hstu_attention_maybe_from_cache(
                 num_heads=self._num_heads,
                 attention_dim=self._attention_dim,
@@ -355,6 +427,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 all_timestamps=all_timestamps,
                 invalid_attn_mask=invalid_attn_mask,
                 rel_attn_bias=self._rel_attn_bias,
+                rotary_emb=self.rope, # [新增] 传入 rope 实例
             )
         elif self._normalization == "softmax_rel_bias":
             if delta_x_offsets is not None:
@@ -616,6 +689,8 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
                     dropout_ratio=linear_dropout_rate,
                     attn_dropout_ratio=attn_dropout_rate,
                     concat_ua=concat_ua,
+                    use_rope=True, 
+                    max_length=max_sequence_len + max_output_len
                 )
                 for _ in range(num_blocks)
             ],
