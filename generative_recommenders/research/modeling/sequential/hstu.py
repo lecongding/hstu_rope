@@ -641,7 +641,7 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
         similarity_module: SimilarityModule,
         input_features_preproc_module: InputFeaturesPreprocessorModule,
         output_postproc_module: OutputPostprocessorModule,
-        enable_relative_attention_bias: bool = True,
+        enable_relative_attention_bias: bool = False,
         concat_ua: bool = False,
         verbose: bool = True,
     ) -> None:
